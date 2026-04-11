@@ -1,128 +1,183 @@
 #include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/event_groups.h"
+#include "esp_random.h"
+
 #include "esp_wifi.h"
-#include "esp_system.h"
 #include "esp_event.h"
 #include "esp_log.h"
 #include "nvs_flash.h"
-#include "my_data.h"
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
-#include "freertos/semphr.h"
-#include "freertos/event_groups.h"
-#include <esp_http_server.h>
 
-static const char *TAG = "Websocket Server: ";
+#include "esp_http_server.h"
 
-static void wifi_event_handler(void *event_handler_arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
+#define WIFI_SSID "49_2.4"
+#define WIFI_PASS "12345678"
+
+static const char *TAG = "ws_server";
+
+static httpd_handle_t server = NULL;
+static int client_fd = -1;
+
+static EventGroupHandle_t wifi_event_group;
+#define WIFI_CONNECTED_BIT BIT0
+
+/* ---------------- WiFi Event Handler ---------------- */
+
+static void wifi_event_handler(void* arg,
+                               esp_event_base_t event_base,
+                               int32_t event_id,
+                               void* event_data)
 {
-    switch (event_id)
+    if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP)
     {
-    case WIFI_EVENT_STA_START:
-        printf("WiFi connecting ... \n");
-        break;
-    case WIFI_EVENT_STA_CONNECTED:
-        printf("WiFi connected ... \n");
-        break;
-    case WIFI_EVENT_STA_DISCONNECTED:
-        printf("WiFi lost connection ... \n");
-        break;
-    case IP_EVENT_STA_GOT_IP:
-        printf("WiFi got IP ... \n\n");
-        break;
-    default:
-        break;
+        ESP_LOGI(TAG, "WiFi connected");
+        xEventGroupSetBits(wifi_event_group, WIFI_CONNECTED_BIT);
     }
 }
 
-void wifi_connection()
+/* ---------------- WiFi Init ---------------- */
+
+static void wifi_init()
 {
-    nvs_flash_init();
-    // 1 - Wi-Fi/LwIP Init Phase
-    esp_netif_init();                    // TCP/IP initiation 					s1.1
-    esp_event_loop_create_default();     // event loop 			                s1.2
-    esp_netif_create_default_wifi_sta(); // WiFi station 	                    s1.3
-    wifi_init_config_t wifi_initiation = WIFI_INIT_CONFIG_DEFAULT();
-    esp_wifi_init(&wifi_initiation); // 					                    s1.4
-    // 2 - Wi-Fi Configuration Phase
-    esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_event_handler, NULL);
-    esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, wifi_event_handler, NULL);
-    wifi_config_t wifi_configuration = {
+    wifi_event_group = xEventGroupCreate();
+
+    esp_netif_init();
+    esp_event_loop_create_default();
+    esp_netif_create_default_wifi_sta();
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    esp_wifi_init(&cfg);
+
+    esp_event_handler_register(IP_EVENT,
+                               IP_EVENT_STA_GOT_IP,
+                               wifi_event_handler,
+                               NULL);
+
+    wifi_config_t wifi_config = {
         .sta = {
-            .ssid = SSID,
-            .password = PASS}};
-    esp_wifi_set_config(ESP_IF_WIFI_STA, &wifi_configuration);
-    // 3 - Wi-Fi Start Phase
+            .ssid = WIFI_SSID,
+            .password = WIFI_PASS
+        }
+    };
+
+    esp_wifi_set_mode(WIFI_MODE_STA);
+    esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
     esp_wifi_start();
-    // 4- Wi-Fi Connect Phase
     esp_wifi_connect();
+
+    xEventGroupWaitBits(
+        wifi_event_group,
+        WIFI_CONNECTED_BIT,
+        false,
+        true,
+        portMAX_DELAY
+    );
 }
 
-// Asynchronous response data structure
-struct async_resp_arg
+/* ---------------- WebSocket Handler ---------------- */
+
+static esp_err_t ws_handler(httpd_req_t *req)
 {
-    httpd_handle_t hd; // Server instance
-    int fd;            // Session socket file descriptor
-};
+    if (req->method == HTTP_GET)
+    {
+        ESP_LOGI(TAG, "WebSocket handshake complete");
 
-// The asynchronous response
-static void generate_async_resp(void *arg)
-{
-    // Data format to be sent from the server as a response to the client
-    char http_string[250];
-    char *data_string = "Hello from ESP32 websocket server ...";
-    sprintf(http_string, "HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n", strlen(data_string));
+        client_fd = httpd_req_to_sockfd(req);
 
-    // Initialize asynchronous response data structure
-    struct async_resp_arg *resp_arg = (struct async_resp_arg *)arg;
-    httpd_handle_t hd = resp_arg->hd;
-    int fd = resp_arg->fd;
+        return ESP_OK;
+    }
 
-    // Send data to the client
-    ESP_LOGI(TAG, "Executing queued work fd : %d", fd);
-    httpd_socket_send(hd, fd, http_string, strlen(http_string), 0);
-    httpd_socket_send(hd, fd, data_string, strlen(data_string), 0);
+    httpd_ws_frame_t frame;
+    memset(&frame, 0, sizeof(frame));
 
-    free(arg);
-}
+    frame.type = HTTPD_WS_TYPE_TEXT;
 
-// Initialize a queue for asynchronous communication
-static esp_err_t async_get_handler(httpd_req_t *req)
-{
-    struct async_resp_arg *resp_arg = malloc(sizeof(struct async_resp_arg));
-    resp_arg->hd = req->handle;
-    resp_arg->fd = httpd_req_to_sockfd(req);
-    ESP_LOGI(TAG, "Queuing work fd : %d", resp_arg->fd);
-    httpd_queue_work(req->handle, generate_async_resp, resp_arg);
+    httpd_ws_recv_frame(req, &frame, 0);
+
+    if (frame.len)
+    {
+        frame.payload = malloc(frame.len + 1);
+
+        httpd_ws_recv_frame(req, &frame, frame.len);
+
+        frame.payload[frame.len] = 0;
+
+        ESP_LOGI(TAG, "Received: %s", (char*)frame.payload);
+
+        free(frame.payload);
+    }
+
     return ESP_OK;
 }
 
-// Create URI (Uniform Resource Identifier) 
-// for the server which is added to default gateway
-static const httpd_uri_t uri_handler = {
-    .uri = "/ws",           // URL added to WiFi's default gateway
-    .method = HTTP_GET,
-    .handler = async_get_handler,
-    .user_ctx = NULL,
-};
+/* ---------------- Telemetry Task ---------------- */
 
-static void websocket_app_start(void)
+void telemetry_task(void *arg)
 {
-    httpd_handle_t server = NULL;
-    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-
-    // Start the httpd server
-    ESP_LOGI(TAG, "Starting server on port: '%d'", config.server_port);
-    if (httpd_start(&server, &config) == ESP_OK)
+    while (1)
     {
-        // Registering the uri_handler
-        ESP_LOGI(TAG, "Registering URI handler");
-        httpd_register_uri_handler(server, &uri_handler);
+        if (server && client_fd != -1)
+        {
+            char msg[64];
+
+            int value = esp_random() % 100;
+
+            sprintf(msg, "{\"value\":%d}", value);
+
+            httpd_ws_frame_t frame = {
+                .payload = (uint8_t*)msg,
+                .len = strlen(msg),
+                .type = HTTPD_WS_TYPE_TEXT
+            };
+
+            httpd_ws_send_frame_async(server, client_fd, &frame);
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }
 
+/* ---------------- Start Server ---------------- */
+
+static httpd_handle_t start_webserver(void)
+{
+    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+
+    httpd_handle_t server = NULL;
+
+    if (httpd_start(&server, &config) == ESP_OK)
+    {
+        httpd_uri_t ws_uri = {
+            .uri = "/ws",
+            .method = HTTP_GET,
+            .handler = ws_handler,
+            .is_websocket = true
+        };
+
+        httpd_register_uri_handler(server, &ws_uri);
+    }
+
+    return server;
+}
+
+/* ---------------- Main ---------------- */
+
 void app_main(void)
 {
-    wifi_connection();
-    vTaskDelay(1500 / portTICK_RATE_MS);
-    websocket_app_start();
+    nvs_flash_init();
+
+    wifi_init();
+
+    server = start_webserver();
+
+    xTaskCreate(telemetry_task,
+                "telemetry",
+                4096,
+                NULL,
+                5,
+                NULL);
 }
