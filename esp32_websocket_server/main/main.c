@@ -14,16 +14,18 @@
 
 #include "esp_http_server.h"
 
-#define WIFI_SSID "49_2.4"
+#define WIFI_SSID "MW_LENOVO"
 #define WIFI_PASS "12345678"
 
 static const char *TAG = "ws_server";
 
-static httpd_handle_t server = NULL;
 static int client_fd = -1;
-
+static httpd_handle_t server = NULL;
 static EventGroupHandle_t wifi_event_group;
 #define WIFI_CONNECTED_BIT BIT0
+
+// Function Prototypes
+void wifi_init(char *wifi_ssid, char *wifi_pass);
 
 /* ---------------- WiFi Event Handler ---------------- */
 
@@ -41,7 +43,7 @@ static void wifi_event_handler(void* arg,
 
 /* ---------------- WiFi Init ---------------- */
 
-static void wifi_init()
+void wifi_init(char *wifi_ssid, char *wifi_pass)
 {
     wifi_event_group = xEventGroupCreate();
 
@@ -59,10 +61,13 @@ static void wifi_init()
 
     wifi_config_t wifi_config = {
         .sta = {
-            .ssid = WIFI_SSID,
-            .password = WIFI_PASS
+            .ssid = {0},
+            .password = {0}
         }
     };
+
+    strncpy((char*)wifi_config.sta.ssid, (const char*)wifi_ssid, sizeof(wifi_config.sta.ssid) - 1);
+    strncpy((char*)wifi_config.sta.password, (const char*)wifi_pass, sizeof(wifi_config.sta.password) - 1);
 
     esp_wifi_set_mode(WIFI_MODE_STA);
     esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
@@ -122,11 +127,11 @@ void telemetry_task(void *arg)
     {
         if (server && client_fd != -1)
         {
-            char msg[64];
+            char msg[256];
 
             int value = esp_random() % 100;
 
-            sprintf(msg, "{\"value\":%d}", value);
+            sprintf(msg, "{\"Time\":%d, \"Reading 1\":%d, \"Reading 2\":%d, \"Reading 3\":%d, \"Reading 4\":%d, \"Reading 5\":%d, \"Reading 6\":%d}", value, value, value, value, value, value, value);
 
             httpd_ws_frame_t frame = {
                 .payload = (uint8_t*)msg,
@@ -170,7 +175,7 @@ void app_main(void)
 {
     nvs_flash_init();
 
-    wifi_init();
+    wifi_init(WIFI_SSID, WIFI_PASS);
 
     server = start_webserver();
 
