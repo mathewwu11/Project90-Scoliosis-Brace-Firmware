@@ -13,8 +13,11 @@
 #include "nvs_flash.h"
 
 #include "esp_http_server.h"
+#include "AP_HTTP_Setup.h"
 
-#define WIFI_SSID "mw"
+// changing ssid and password requires full clean and rebuild of the project
+// compiler lowkirk trips out
+#define WIFI_SSID "49_24"
 #define WIFI_PASS "12345678"
 
 static const char *TAG = "ws_server";
@@ -24,11 +27,14 @@ static httpd_handle_t server = NULL;
 static EventGroupHandle_t wifi_event_group;
 #define WIFI_CONNECTED_BIT BIT0
 
+char user_ssid[64] = {0};
+char user_password[64] = {0};
+
 // Function Prototypes
 void wifi_init(char *wifi_ssid, char *wifi_pass);
 
 /* ---------------- WiFi Event Handler ---------------- */
-
+// Despite the fact that the event handler is registered for both WIFI_EVENT and IP_EVENT.
 static void wifi_event_handler(void* arg,
                                esp_event_base_t event_base,
                                int32_t event_id,
@@ -39,6 +45,13 @@ static void wifi_event_handler(void* arg,
         ESP_LOGI(TAG, "WiFi connected");
         xEventGroupSetBits(wifi_event_group, WIFI_CONNECTED_BIT);
     }
+
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) 
+    {
+        ESP_LOGI(TAG, "Invalid SSID or Password. Restarting device...");
+        esp_restart();
+    }
+
 }
 
 /* ---------------- WiFi Init ---------------- */
@@ -49,20 +62,34 @@ void wifi_init(char *wifi_ssid, char *wifi_pass)
 
     esp_netif_init();
     esp_event_loop_create_default();
-    esp_netif_create_default_wifi_sta();
+    esp_netif_t *sta_netif = esp_netif_create_default_wifi_sta();
+    esp_netif_set_hostname(sta_netif, "P90-SBTS-Device");
 
-    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    esp_wifi_init(&cfg);
+    //wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    //esp_wifi_init(&cfg);
 
-    esp_event_handler_register(IP_EVENT,
-                               IP_EVENT_STA_GOT_IP,
-                               wifi_event_handler,
-                               NULL);
+    //esp_event_handler_register(IP_EVENT,
+                               //IP_EVENT_STA_GOT_IP,
+                               //wifi_event_handler,
+                               //NULL);
 
+    esp_event_handler_instance_register(WIFI_EVENT,
+                                        ESP_EVENT_ANY_ID,
+                                        &wifi_event_handler,
+                                        NULL,
+                                        NULL);
+
+    esp_event_handler_instance_register(IP_EVENT,
+                                        IP_EVENT_STA_GOT_IP,
+                                        &wifi_event_handler,
+                                        NULL,
+                                        NULL);
+    
     wifi_config_t wifi_config = {
         .sta = {
             .ssid = {0},
-            .password = {0}
+            .password = {0},
+            .failure_retry_cnt = 3
         }
     };
 
@@ -169,13 +196,61 @@ static httpd_handle_t start_webserver(void)
     return server;
 }
 
+void clear_server(void)
+{
+    if (server) 
+    {
+        httpd_stop(server);
+        server = NULL;
+    }
+}
+
 /* ---------------- Main ---------------- */
 
 void app_main(void)
 {
-    nvs_flash_init();
+    // Initialize NVS
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        nvs_flash_erase();
+        nvs_flash_init();
+    }
 
-    wifi_init(WIFI_SSID, WIFI_PASS);
+    // Initialize TCP/IP stack
+    esp_netif_init();
+    esp_event_loop_create_default();
+
+    // Start WiFi AP
+    wifi_init_ap();
+
+    // Start ap server
+    server = start_apserver();
+    
+    while(1){
+        // make sure buffers are cleared before copying new values
+        memset(user_ssid, 0, sizeof(user_ssid));
+        memset(user_password, 0, sizeof(user_password));
+        
+        strcpy(user_ssid, copy_ssid());
+        strcpy(user_password, copy_pass());
+
+        if(user_ssid[0] != '\0' && user_password[0] != '\0'){
+            break;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+
+    //while (!ap_stopped) {
+    //    vTaskDelay(pdMS_TO_TICKS(10));
+    //    ESP_LOGI(TAG, "Waiting for AP to stop...");
+    //}
+
+    clear_server();
+    stop_ap();
+
+    wifi_init(user_ssid, user_password);
+    //wifi_init(WIFI_SSID, WIFI_PASS);
 
     server = start_webserver();
 
