@@ -15,7 +15,7 @@
 #include "esp_netif.h"
 #include "esp_http_server.h"
 
-#define AP_SSID "ESP32_Config"
+#define AP_SSID "SBTS_Config"
 #define AP_PASS "12345678"
 
 void url_decode(char *dst, const char *src);
@@ -26,6 +26,7 @@ void wifi_init_ap(void);
 char* copy_ssid(void);
 char* copy_pass(void);
 void stop_ap(void);
+char* get_ap_ip(void);
 
 
 #endif /* AP_HTTP_SETUP_H_ */

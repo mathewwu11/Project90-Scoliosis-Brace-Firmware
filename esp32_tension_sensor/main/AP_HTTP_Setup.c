@@ -164,6 +164,7 @@ httpd_handle_t start_apserver(void)
     esp_netif_get_ip_info(ap_netif, &ip_info);
 
     ESP_LOGI(TAG, "AP IP Address: " IPSTR, IP2STR(&ip_info.ip));
+
     return server;
 }
 
@@ -229,6 +230,22 @@ void stop_ap(void) {
     }
 
     vTaskDelay(pdMS_TO_TICKS(1000)); // Wait for WiFi to fully stop
+}
+
+char* get_ap_ip(void) {
+    esp_netif_t *ap_netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
+
+    if (ap_netif == NULL) {
+        ESP_LOGE(TAG, "Failed to get AP netif handle");
+        return "";
+    }
+
+    esp_netif_ip_info_t ip_info;
+    esp_netif_get_ip_info(ap_netif, &ip_info);
+
+    static char ip_str[16];
+    snprintf(ip_str, sizeof(ip_str), IPSTR, IP2STR(&ip_info.ip));
+    return ip_str;
 }
 
 // EOF
