@@ -5,14 +5,19 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
+#include "esp_system.h"
 #include "esp_random.h"
+#include "esp_netif.h"
 #include "driver/gpio.h"
 #include "driver/i2c_master.h"
+#include "driver/spi_master.h"
 
 #include "esp_wifi.h"
 #include "esp_event.h"
 #include "esp_log.h"
 #include "nvs_flash.h"
+#include "mdns.h"
+#include "cJSON.h"
 
 #include "esp_http_server.h"
 #include "AP_HTTP_Setup.h"
@@ -22,6 +27,14 @@
 #define DATAOUT    GPIO_NUM_11
 #define DATAIN     GPIO_NUM_12
 #define SPICLOCK   GPIO_NUM_13
+
+#define PIN_NUM_MISO 12   // MCP3208 DOUT
+#define PIN_NUM_MOSI 11   // MCP3208 DIN
+#define PIN_NUM_CLK  13   // MCP3208 CLK
+#define PIN_NUM_CS   10    // MCP3208 CS/SHDN
+
+#define SPI_HOST_USED SPI2_HOST   // VSPI on most ESP32 dev boards
+#define ADC_CHANNEL   0           // channel we want to read
 
 #define I2C_PORT                I2C_NUM_0
 #define I2C_SDA_GPIO            21
@@ -38,8 +51,14 @@
 #define DS3231_REG_MONTH        0x05
 #define DS3231_REG_YEAR         0x06
 
+#define MDNS_HOSTNAME        "SBTS"
+#define MDNS_INSTANCE_NAME   "SBTS Server"
+
+
+
 static const char *TAG = "ws_server";
 
+static int s_retry_num = 0;
 static int client_fd = -1;
 static httpd_handle_t server = NULL;
 static EventGroupHandle_t wifi_event_group;
@@ -47,6 +66,8 @@ static EventGroupHandle_t wifi_event_group;
 
 static i2c_master_dev_handle_t ds3231_handle;
 static i2c_master_bus_handle_t bus_handle;
+
+static spi_device_handle_t spi_handle;
 
 typedef struct
 {
@@ -64,6 +85,7 @@ char user_password[64] = {0};
 
 // Function Prototypes
 void wifi_init(char *wifi_ssid, char *wifi_pass);
+static void got_ip_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data);
 
 /* ---------------- RTC Handler ---------------- */
 static esp_err_t rtc_i2c_init(void)
@@ -121,47 +143,63 @@ static esp_err_t ds3231_get_time(ds3231_time_t *time)
 }
 
 /* ---------------- ADC Handler ---------------- */
-int read_adc(int channel)
+
+static void mcp3208_spi_init(void)
 {
-    int adcvalue = 0;
-    uint8_t commandbits = 0b11000000;
+    esp_err_t ret;
 
-    // Allow channel selection
-    commandbits |= ((channel) << 3);
+    spi_bus_config_t buscfg = {
+        .miso_io_num = PIN_NUM_MISO,
+        .mosi_io_num = PIN_NUM_MOSI,
+        .sclk_io_num = PIN_NUM_CLK,
+        .quadwp_io_num = -1,
+        .quadhd_io_num = -1,
+        .max_transfer_sz = 4,
+    };
 
-    // Select ADC
-    gpio_set_level(SELPIN, 0);
+    spi_device_interface_config_t devcfg = {
+        .clock_speed_hz = 1 * 1000 * 1000,  // 1 MHz, well within MCP3208 limits
+        .mode = 0,                          // SPI mode 0 (CPOL=0, CPHA=0)
+        .spics_io_num = PIN_NUM_CS,
+        .queue_size = 1,
+    };
 
-    // Send command bits (bits 7 down to 3)
-    for (int i = 7; i >= 3; i--)
-    {
-        gpio_set_level(DATAOUT,
-                      (commandbits & (1 << i)) ? 1 : 0);
+    ret = spi_bus_initialize(SPI_HOST_USED, &buscfg, SPI_DMA_DISABLED);
+    ESP_ERROR_CHECK(ret);
 
-        gpio_set_level(SPICLOCK, 1);
-        gpio_set_level(SPICLOCK, 0);
-    }
+    ret = spi_bus_add_device(SPI_HOST_USED, &devcfg, &spi_handle);
+    ESP_ERROR_CHECK(ret);
+}
 
-    // Ignore two null bits
-    gpio_set_level(SPICLOCK, 1);
-    gpio_set_level(SPICLOCK, 0);
+/**
+ * Read a single-ended channel (0-7) from the MCP3208.
+ * Returns a 12-bit value (0-4095).
+ */
+static uint16_t mcp3208_read_channel(spi_device_handle_t spi, uint8_t channel)
+{
+    // MCP3208 command format:
+    // Byte0: 0000 011 | D2   (start bit=1, single/diff=1, then MSB of channel)
+    // Byte1: D1 D0 0000 00   (remaining channel bits, rest don't-care)
+    // Byte2: 0000 0000       (clocks out remaining data bits)
+    uint8_t tx_data[3];
+    uint8_t rx_data[3] = {0};
 
-    gpio_set_level(SPICLOCK, 1);
-    gpio_set_level(SPICLOCK, 0);
+    tx_data[0] = 0x06 | ((channel & 0x07) >> 2);
+    tx_data[1] = (channel & 0x03) << 6;
+    tx_data[2] = 0x00;
 
-    // Read 12 bits
-    for (int i = 11; i >= 0; i--)
-    {
-        adcvalue |= (gpio_get_level(DATAIN) << i);
+    spi_transaction_t t = {
+        .length = 8 * 3,       // 3 bytes = 24 bits
+        .tx_buffer = tx_data,
+        .rx_buffer = rx_data,
+    };
 
-        gpio_set_level(SPICLOCK, 1);
-        gpio_set_level(SPICLOCK, 0);
-    }
+    esp_err_t ret = spi_device_transmit(spi, &t);
+    ESP_ERROR_CHECK(ret);
 
-    // Disable ADC
-    gpio_set_level(SELPIN, 1);
-
-    return adcvalue;
+    // 12-bit result spans the low nibble of rx_data[1] and all of rx_data[2]
+    uint16_t value = ((rx_data[1] & 0x0F) << 8) | rx_data[2];
+    return value;
 }
 
 /* ---------------- WiFi Event Handler ---------------- */
@@ -196,25 +234,17 @@ void wifi_init(char *wifi_ssid, char *wifi_pass)
     esp_netif_t *sta_netif = esp_netif_create_default_wifi_sta();
     esp_netif_set_hostname(sta_netif, "P90-SBTS-Device");
 
-    //wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    //esp_wifi_init(&cfg);
-
-    //esp_event_handler_register(IP_EVENT,
-                               //IP_EVENT_STA_GOT_IP,
-                               //wifi_event_handler,
-                               //NULL);
-
     esp_event_handler_instance_register(WIFI_EVENT,
                                         ESP_EVENT_ANY_ID,
                                         &wifi_event_handler,
                                         NULL,
                                         NULL);
 
-    esp_event_handler_instance_register(IP_EVENT,
-                                        IP_EVENT_STA_GOT_IP,
-                                        &wifi_event_handler,
-                                        NULL,
-                                        NULL);
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, 
+                                                        IP_EVENT_STA_GOT_IP, 
+                                                        &got_ip_handler, 
+                                                        NULL, 
+                                                        NULL));
     
     wifi_config_t wifi_config = {
         .sta = {
@@ -239,6 +269,20 @@ void wifi_init(char *wifi_ssid, char *wifi_pass)
         true,
         portMAX_DELAY
     );
+}
+
+// mDNS service initialization
+static void start_mdns_service(void)
+{
+    esp_err_t err = mdns_init();
+    if (err) {
+        ESP_LOGE(TAG, "mDNS init failed: %d", err);
+        return;
+    }
+    mdns_hostname_set(MDNS_HOSTNAME);
+    mdns_instance_name_set(MDNS_INSTANCE_NAME);
+    mdns_service_add(NULL, "_ws", "_tcp", 80, NULL, 0);
+    ESP_LOGI(TAG, "mDNS started: %s.local", MDNS_HOSTNAME);
 }
 
 /* ---------------- WebSocket Handler ---------------- */
@@ -278,24 +322,26 @@ static esp_err_t ws_handler(httpd_req_t *req)
 }
 
 char* get_ws_ip(void) {
-    esp_netif_t *ap_netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
-
-    if (ap_netif == NULL) {
-        ESP_LOGE(TAG, "Failed to get WS netif handle");
-        return "";
-    }
-
-    esp_netif_ip_info_t ip_info;
-    esp_netif_get_ip_info(ap_netif, &ip_info);
-
     static char ip_str[16];
-    snprintf(ip_str, sizeof(ip_str), IPSTR, IP2STR(&ip_info.ip));
+    snprintf(ip_str, sizeof(ip_str), "%s.local", MDNS_HOSTNAME);
     return ip_str;
+}
+
+static void got_ip_handler(void *arg, esp_event_base_t event_base,
+                            int32_t event_id, void *event_data)
+{
+    ip_event_got_ip_t *event = (ip_event_got_ip_t *) event_data;
+    ESP_LOGI(TAG, "Got IP: " IPSTR, IP2STR(&event->ip_info.ip));
+    s_retry_num = 0;
+    xEventGroupSetBits(wifi_event_group, WIFI_CONNECTED_BIT);
+
+    start_mdns_service();
+
 }
 
 
 /* ---------------- Telemetry Task ---------------- */
-
+// task that sends real-time telemetry data to the connected WebSocket client every second
 void telemetry_task(void *arg)
 {
     while (1)
@@ -304,33 +350,21 @@ void telemetry_task(void *arg)
         {
             char msg[256];
 
-            int value = esp_random() % 100;
-
-            int reading1 = read_adc(0);
-            int reading2 = read_adc(1);
-            int reading3 = read_adc(2);
-            int reading4 = read_adc(3);
-            int reading5 = read_adc(4);
-            int reading6 = read_adc(5);
+            uint16_t reading1 = mcp3208_read_channel(spi_handle, ADC_CHANNEL);
             
             ds3231_time_t current_time;
 
             ds3231_get_time(&current_time);
 
             sprintf(msg, 
-                "{\"Time\":%04d-%02d-%02dT%02d:%02d:%02d-06:00, \"Reading 1\":%d, \"Reading 2\":%d, \"Reading 3\":%d, \"Reading 4\":%d, \"Reading 5\":%d, \"Reading 6\":%d}", 
+                "{\"Time\":%04d-%02d-%02dT%02d:%02d:%02d-06:00, \"Reading\":%4d}", 
                 current_time.year, 
                 current_time.month, 
                 current_time.date, 
                 current_time.hours, 
                 current_time.minutes, 
                 current_time.seconds, 
-                reading1, 
-                reading2, 
-                reading3, 
-                reading4, 
-                reading5, 
-                reading6);
+                reading1);
 
             httpd_ws_frame_t frame = {
                 .payload = (uint8_t*)msg,
@@ -387,31 +421,9 @@ void app_main(void)
 
     rtc_i2c_init();
 
+    ESP_LOGI(TAG, "Initializing SPI for MCP3208...");
+    mcp3208_spi_init();
 
-    // Configure output pins
-    gpio_config_t output_conf = {
-        .pin_bit_mask =
-            (1ULL << SELPIN) |
-            (1ULL << DATAOUT) |
-            (1ULL << SPICLOCK),
-        .mode = GPIO_MODE_OUTPUT,
-    };
-
-    gpio_config(&output_conf);
-
-    // Configure input pin
-    gpio_config_t input_conf = {
-        .pin_bit_mask = (1ULL << DATAIN),
-        .mode = GPIO_MODE_INPUT,
-    };
-
-    gpio_config(&input_conf);
-
-    // Initial states
-    gpio_set_level(SELPIN, 1);
-    gpio_set_level(DATAOUT, 0);
-    gpio_set_level(SPICLOCK, 0);
-    
     // Initialize NVS
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {

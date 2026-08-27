@@ -158,7 +158,17 @@ static esp_err_t ds3231_get_time(ds3231_time_t *time)
 void app_main(void)
 {
     ESP_ERROR_CHECK(i2c_master_init());
-
+    /*
+    ds3231_time_t set_time = {
+        .seconds = 0,
+        .minutes = 10,
+        .hours   = 17,   // 24-hour format
+        .day     = 4,    // day of week, 1 = Sunday (or whatever convention you use)
+        .date    = 26,
+        .month   = 8,
+        .year    = 2026
+    };
+    */
 
     if (i2c_master_probe(bus_handle, DS3231_I2C_ADDR, 1000) == ESP_OK)
     {
@@ -169,6 +179,17 @@ void app_main(void)
         printf("Device not found at 0x%02X\n", DS3231_I2C_ADDR);
         return;
     }
+
+    /*
+    if (ds3231_set_time(&set_time) == ESP_OK)
+    {
+        ESP_LOGI(TAG, "Time set successfully");
+    }
+    else
+    {
+        ESP_LOGE(TAG, "Failed to set time");
+    }
+    */
 
     while (1)
     {

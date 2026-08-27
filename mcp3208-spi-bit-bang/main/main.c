@@ -84,11 +84,7 @@ void app_main(void)
         readvalue = read_adc(0);
         printf("Channel 0\n");
         printf("%d\n", readvalue);
-        // Pin 2 on MCP3208
-        readvalue = read_adc(1);
-        printf("Channel 1\n");
-        printf("%d\n\n", readvalue);
-
+   
         vTaskDelay(pdMS_TO_TICKS(250));
     }
 }
